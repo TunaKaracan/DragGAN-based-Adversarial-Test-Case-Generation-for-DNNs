@@ -1,0 +1,166 @@
+import gc
+import logging
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import Any, Callable, Optional, Union
+
+import numpy as np
+import torch
+from numpy.typing import NDArray
+from PIL import Image
+from torch import Tensor
+import cv2
+
+from .manipulator import Manipulator
+from .objectives import CriterionCollection
+from .optimizer import Optimizer
+from .sut import SUT
+
+TEarlyTermCallable = Optional[Callable[[Any], tuple[bool, Optional[Any]]]]
+
+class SMOO(ABC):
+	"""A testing object based on the SMOO-Framework."""
+
+	"""Used Components."""
+	_sut: SUT
+	_manipulator: Manipulator
+	_optimizer: Optimizer
+	_objectives: CriterionCollection
+
+	_restrict_classes: Optional[list[int]]
+	_silent: bool
+
+	def __init__(
+			self,
+			*,
+			sut: SUT,
+			manipulator: Manipulator,
+			optimizer: Optimizer,
+			objectives: CriterionCollection,
+			restrict_classes: Optional[list[int]],
+			use_wandb: bool,
+			early_termination: TEarlyTermCallable = None,
+	):
+		"""
+		Initialize the SMOO Object.
+
+		:param sut: The system-under-test.
+		:param manipulator: The manipulator object.
+		:param optimizer: The optimizer object.
+		:param objectives: The objectives used.
+		:param restrict_classes: What classes to restrict predictions to.
+		:param use_wandb: Whether to use wandb.
+		:param early_termination: A function that can be used to early terminate the workflow.
+		"""
+
+		self._sut = sut
+		self._manipulator = manipulator
+		self._optimizer = optimizer
+		self._objectives = objectives
+
+		self._restrict_classes = restrict_classes
+		self._use_wandb = use_wandb
+		self._early_termination = early_termination or (lambda _: (False, None))
+
+	@abstractmethod
+	def test(self) -> None:
+		"""Every workflow needs a testing loop."""
+		...
+
+	@staticmethod
+	def _cleanup() -> None:
+		"""Cleanup memory stuff."""
+		gc.collect()
+		torch.cuda.empty_cache()
+
+	@staticmethod
+	def _save_tensor_as_image(tensor: Union[NDArray, Tensor],
+							  path: str,
+							  handles: list[list[tuple[int, int]]] = (),
+							  targets: list[list[tuple[int, int]]] = (),
+							  img_resolution: int = None) -> None:
+		"""
+		Save a torch tensor [0,1] as an image.
+
+		:param tensor: The tensor to save.
+		:param path: The directory to save the image to.
+		"""
+
+		array = tensor.cpu().numpy() if isinstance(tensor, torch.Tensor) else tensor
+		image = array.squeeze().transpose(1, 2, 0)  # C x H x W  -> H x W x C
+		image = (image * 255).astype(np.uint8).copy()  # [0, 1] -> [0, 255]
+
+		for handle, target in zip(handles, targets):
+			for i, ((hy, hx), (ty, tx)) in enumerate(zip(handle, target)):
+				r, s = round(16 / 512 * img_resolution), round(4 / 512 * img_resolution)
+
+
+				cv2.ellipse(image, (tx, ty), (r, r), 0, 0, 360, (255, 0, 0), -1, lineType=cv2.LINE_AA)
+
+				dist = np.linalg.norm((tx - hx, ty - hy))
+				tip_length = 0.07 * 100 / dist
+				cv2.arrowedLine(image, (hx, hy), (tx, ty), (255, 255, 255), s, tipLength=tip_length, line_type=cv2.LINE_AA)
+
+				cv2.ellipse(image, (hx, hy), (r, r), 0, 0, 360, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+
+				label = str(i)
+				font = cv2.FONT_HERSHEY_SIMPLEX
+
+				(text_w, text_h), _ = cv2.getTextSize(label, font, 0.4, 1)
+
+				text_hx = int(hx - text_w // 2)
+				text_hy = int(hy + text_h // 2)
+
+				cv2.putText(image, label, (text_hx, text_hy), font, 0.4, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+		Image.fromarray(image).save(path)
+
+	@staticmethod
+	def _get_time_seed() -> int:
+		"""
+		A simple function to generate a seed from the current timestamp.
+
+		:returns: A seed based on the timestamp.
+		"""
+
+		now = datetime.now()
+		return int(round(now.timestamp()))
+
+	@staticmethod
+	def _assure_rgb(image: Tensor) -> Tensor:
+		"""
+		Assure that an image is or can be converted to RGB.
+
+		:param image: The image to be converted.
+		:returns: The converted image (3 x H x W).
+		:raises ValueError: If the image shape is not recognized.
+		"""
+
+		# Add channel dimension if missing (H,W -> C,H,W)
+
+		if image.ndim == 2:
+			image = image.unsqueeze(0)
+
+		# Channel is always at index -3 for (...,C,H,W) format
+		channel_idx = image.ndim - 3
+		channels = image.shape[channel_idx]
+
+		if channels == 1:
+			# Repeat single channel 3 times to make RGB
+			return image.repeat_interleave(3, dim=channel_idx)
+		elif channels == 3:
+			return image
+		else:
+			raise ValueError(f"Unknown image shape. {image.shape}")
+
+	def _process(self, x: Tensor) -> Tensor:
+		"""
+		A wrapper to predict with additional conditions.
+
+		:param x: The image to be predicted.
+		:returns: The predicted labels.
+		"""
+
+		logging.info(f"Feeding Testcases to {self._sut.__class__.__name__}.")
+		y_hat = self._sut.process_input(x)
+		return y_hat if self._restrict_classes is None else y_hat[:, self._restrict_classes]
